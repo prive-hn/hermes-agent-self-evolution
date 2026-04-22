@@ -24,3 +24,8 @@ snapshots/
 .vscode/
 *.swp
 *.swo
+
+.rotation-index
+logs/
+output/
+nightly_evolve.sh
