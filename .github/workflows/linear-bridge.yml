@@ -2,7 +2,7 @@ name: Linear Bridge
 
 on:
   pull_request:
-    types: [opened, ready_for_review]
+    types: [opened, ready_for_review, closed]
 
 permissions:
   pull-requests: write
@@ -34,6 +34,7 @@ jobs:
             const prBody = pr.body || '';
             const prUrl = pr.html_url;
             const repoName = context.repo.repo;
+            const isMerged = pr.merged;
 
             const TEAM_ID = '6f0a4229-08bb-4cf5-a1bf-fe07fed36fc3'; // PRV
             const IN_REVIEW_STATE = 'c1bf9065-d602-43e9-8177-e3ca3d7b1253';
@@ -56,64 +57,64 @@ jobs:
               return data.data;
             }
 
-            // Dynamic project lookup — match repo name to Linear project name
-            // Handles: repo "prive-engine" matches project "prive-engine"
-            // Also handles variants like "luca-prive-portal" matching repo "prive-portal"
-            async function findProjectId(repo) {
-              const result = await linearGql(`
-                query($teamId: String!) {
-                  team(id: $teamId) {
-                    projects { nodes { id name } }
-                  }
-                }
-              `, { teamId: TEAM_ID });
-
-              const projects = result.team.projects.nodes;
-
-              // Exact match first
-              let match = projects.find(p => p.name === repo);
-              if (match) return match.id;
-
-              // Suffix match: project name ends with repo name (e.g. "luca-prive-portal" ends with "prive-portal")
-              match = projects.find(p => p.name.endsWith(repo));
-              if (match) return match.id;
-
-              // Prefix match: project name starts with repo name
-              match = projects.find(p => p.name.startsWith(repo));
-              if (match) return match.id;
-
-              // Repo name contained in project name
-              match = projects.find(p => p.name.includes(repo));
-              if (match) return match.id;
-
-              return null;
+            // Find Linear issue by PRV-XXX reference in title/body
+            function findIssueRef() {
+              const combined = `${prTitle} ${prBody}`;
+              const m = combined.match(/PRV-(\d+)/i);
+              return m ? parseInt(m[1]) : null;
             }
 
-            // Check if PR title/body already references a Linear issue (PRV-XXX)
-            const combined = `${prTitle} ${prBody}`;
-            const issueMatch = combined.match(/PRV-(\d+)/i);
-
-            if (issueMatch) {
-              // PR already references a Linear issue — link it
-              const issueNumber = parseInt(issueMatch[1]);
-              console.log(`PR references existing issue PRV-${issueNumber}, linking...`);
-
-              const searchResult = await linearGql(`
+            // Fetch issue by number
+            async function fetchIssue(number) {
+              const result = await linearGql(`
                 query($number: Float!, $teamKey: String!) {
                   issues(filter: { number: { eq: $number }, team: { key: { eq: $teamKey } } }, first: 1) {
                     nodes { id identifier title state { id name } }
                   }
                 }
-              `, { number: issueNumber, teamKey: 'PRV' });
+              `, { number, teamKey: 'PRV' });
+              return result.issues.nodes[0] || null;
+            }
 
-              const issues = searchResult.issues.nodes;
-              if (issues.length === 0) {
-                console.log(`PRV-${issueNumber} not found in Linear, creating new issue instead`);
-              } else {
-                const issue = issues[0];
+            // === MERGE HANDLER: close Linear issue ===
+            if (isMerged) {
+              const issueNumber = findIssueRef();
+              if (!issueNumber) {
+                console.log('PR merged but no PRV-XXX reference found, skipping close');
+                return;
+              }
+              const issue = await fetchIssue(issueNumber);
+              if (!issue) {
+                console.log(`PRV-${issueNumber} not found in Linear`);
+                return;
+              }
+              if (issue.state.id === DONE_STATE) {
+                console.log(`${issue.identifier} already Done`);
+                return;
+              }
+              await linearGql(`
+                mutation($id: String!, $input: IssueUpdateInput!) {
+                  issueUpdate(id: $id, input: $input) { success }
+                }
+              `, { id: issue.id, input: { stateId: DONE_STATE } });
+              await linearGql(`
+                mutation($input: CommentCreateInput!) {
+                  commentCreate(input: $input) { success }
+                }
+              `, { input: {
+                issueId: issue.id,
+                body: `PR merged: ${prUrl}\n\n${repoName} — ${prTitle}`,
+              }});
+              console.log(`Closed ${issue.identifier} (PR merged)`);
+              return;
+            }
+
+            // === OPEN / READY: link or create Linear issue ===
+            const issueNumber = findIssueRef();
+            if (issueNumber) {
+              const issue = await fetchIssue(issueNumber);
+              if (issue) {
                 console.log(`Found ${issue.identifier}: ${issue.title} (state: ${issue.state.name})`);
-
-                // Comment PR link on the Linear issue
                 await linearGql(`
                   mutation($input: CommentCreateInput!) {
                     commentCreate(input: $input) { success }
@@ -122,8 +123,6 @@ jobs:
                   issueId: issue.id,
                   body: `External PR opened: ${prUrl}\n\nRepo: ${repoName}\nTitle: ${prTitle}`,
                 }});
-
-                // Move to In Review if not already there or Done
                 if (issue.state.id !== IN_REVIEW_STATE && issue.state.id !== DONE_STATE) {
                   await linearGql(`
                     mutation($id: String!, $input: IssueUpdateInput!) {
@@ -132,8 +131,6 @@ jobs:
                   `, { id: issue.id, input: { stateId: IN_REVIEW_STATE } });
                   console.log(`Moved ${issue.identifier} to In Review`);
                 }
-
-                // Comment Linear link on the PR
                 await github.rest.issues.createComment({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
@@ -179,7 +176,6 @@ jobs:
             const newIssue = createResult.issueCreate.issue;
             console.log(`Created ${newIssue.identifier}: ${newIssue.title}`);
 
-            // Comment PR link on Linear issue
             await linearGql(`
               mutation($input: CommentCreateInput!) {
                 commentCreate(input: $input) { success }
@@ -189,7 +185,6 @@ jobs:
               body: `PR opened: ${prUrl}\n\nRepo: ${repoName}`,
             }});
 
-            // Comment Linear link on the PR
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -198,3 +193,24 @@ jobs:
             });
 
             console.log(`Bridge complete — created ${newIssue.identifier}`);
+
+            // Dynamic project lookup
+            async function findProjectId(repo) {
+              const result = await linearGql(`
+                query($teamId: String!) {
+                  team(id: $teamId) {
+                    projects { nodes { id name } }
+                  }
+                }
+              `, { teamId: TEAM_ID });
+              const projects = result.team.projects.nodes;
+              let match = projects.find(p => p.name === repo);
+              if (match) return match.id;
+              match = projects.find(p => p.name.endsWith(repo));
+              if (match) return match.id;
+              match = projects.find(p => p.name.startsWith(repo));
+              if (match) return match.id;
+              match = projects.find(p => p.name.includes(repo));
+              if (match) return match.id;
+              return null;
+            }
