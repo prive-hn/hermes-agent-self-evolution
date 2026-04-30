@@ -1,0 +1,200 @@
+name: Linear Bridge
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  bridge:
+    # Only for non-draft PRs from the same repo (not forks)
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Bridge PR to Linear
+        uses: actions/github-script@v7
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const LINEAR_API_KEY = process.env.LINEAR_API_KEY;
+            if (!LINEAR_API_KEY) {
+              console.log('LINEAR_API_KEY secret not set, skipping bridge');
+              return;
+            }
+
+            const pr = context.payload.pull_request;
+            const prNumber = pr.number;
+            const prTitle = pr.title;
+            const prBody = pr.body || '';
+            const prUrl = pr.html_url;
+            const repoName = context.repo.repo;
+
+            const TEAM_ID = '6f0a4229-08bb-4cf5-a1bf-fe07fed36fc3'; // PRV
+            const IN_REVIEW_STATE = 'c1bf9065-d602-43e9-8177-e3ca3d7b1253';
+            const DONE_STATE = 'af811b11-9d25-424e-800e-3d6dd02da5b8';
+
+            // Linear GraphQL helper
+            async function linearGql(query, variables = {}) {
+              const res = await fetch('https://api.linear.app/graphql', {
+                method: 'POST',
+                headers: {
+                  'Authorization': LINEAR_API_KEY,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ query, variables }),
+              });
+              const data = await res.json();
+              if (data.errors) {
+                throw new Error(`Linear API error: ${JSON.stringify(data.errors)}`);
+              }
+              return data.data;
+            }
+
+            // Dynamic project lookup — match repo name to Linear project name
+            // Handles: repo "prive-engine" matches project "prive-engine"
+            // Also handles variants like "luca-prive-portal" matching repo "prive-portal"
+            async function findProjectId(repo) {
+              const result = await linearGql(`
+                query($teamId: String!) {
+                  team(id: $teamId) {
+                    projects { nodes { id name } }
+                  }
+                }
+              `, { teamId: TEAM_ID });
+
+              const projects = result.team.projects.nodes;
+
+              // Exact match first
+              let match = projects.find(p => p.name === repo);
+              if (match) return match.id;
+
+              // Suffix match: project name ends with repo name (e.g. "luca-prive-portal" ends with "prive-portal")
+              match = projects.find(p => p.name.endsWith(repo));
+              if (match) return match.id;
+
+              // Prefix match: project name starts with repo name
+              match = projects.find(p => p.name.startsWith(repo));
+              if (match) return match.id;
+
+              // Repo name contained in project name
+              match = projects.find(p => p.name.includes(repo));
+              if (match) return match.id;
+
+              return null;
+            }
+
+            // Check if PR title/body already references a Linear issue (PRV-XXX)
+            const combined = `${prTitle} ${prBody}`;
+            const issueMatch = combined.match(/PRV-(\d+)/i);
+
+            if (issueMatch) {
+              // PR already references a Linear issue — link it
+              const issueNumber = parseInt(issueMatch[1]);
+              console.log(`PR references existing issue PRV-${issueNumber}, linking...`);
+
+              const searchResult = await linearGql(`
+                query($number: Float!, $teamKey: String!) {
+                  issues(filter: { number: { eq: $number }, team: { key: { eq: $teamKey } } }, first: 1) {
+                    nodes { id identifier title state { id name } }
+                  }
+                }
+              `, { number: issueNumber, teamKey: 'PRV' });
+
+              const issues = searchResult.issues.nodes;
+              if (issues.length === 0) {
+                console.log(`PRV-${issueNumber} not found in Linear, creating new issue instead`);
+              } else {
+                const issue = issues[0];
+                console.log(`Found ${issue.identifier}: ${issue.title} (state: ${issue.state.name})`);
+
+                // Comment PR link on the Linear issue
+                await linearGql(`
+                  mutation($input: CommentCreateInput!) {
+                    commentCreate(input: $input) { success }
+                  }
+                `, { input: {
+                  issueId: issue.id,
+                  body: `External PR opened: ${prUrl}\n\nRepo: ${repoName}\nTitle: ${prTitle}`,
+                }});
+
+                // Move to In Review if not already there or Done
+                if (issue.state.id !== IN_REVIEW_STATE && issue.state.id !== DONE_STATE) {
+                  await linearGql(`
+                    mutation($id: String!, $input: IssueUpdateInput!) {
+                      issueUpdate(id: $id, input: $input) { success }
+                    }
+                  `, { id: issue.id, input: { stateId: IN_REVIEW_STATE } });
+                  console.log(`Moved ${issue.identifier} to In Review`);
+                }
+
+                // Comment Linear link on the PR
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  body: `Linked to Linear: [${issue.identifier}](https://linear.app/priveperfumes/issue/${issue.identifier.toLowerCase()})`,
+                });
+                console.log('Bridge complete — linked existing issue');
+                return;
+              }
+            }
+
+            // No existing Linear issue — create one
+            const projectId = await findProjectId(repoName);
+            if (projectId) {
+              console.log(`Matched repo ${repoName} to Linear project`);
+            } else {
+              console.log(`No Linear project matched for repo ${repoName}, creating issue without project`);
+            }
+
+            const createInput = {
+              teamId: TEAM_ID,
+              title: prTitle,
+              description: `Auto-created from [PR #${prNumber}](${prUrl}) in ${repoName}.\n\n${prBody}`,
+              stateId: IN_REVIEW_STATE,
+            };
+            if (projectId) {
+              createInput.projectId = projectId;
+            }
+
+            const createResult = await linearGql(`
+              mutation($input: IssueCreateInput!) {
+                issueCreate(input: $input) {
+                  success
+                  issue { id identifier title }
+                }
+              }
+            `, { input: createInput });
+
+            if (!createResult.issueCreate.success) {
+              throw new Error('Failed to create Linear issue');
+            }
+
+            const newIssue = createResult.issueCreate.issue;
+            console.log(`Created ${newIssue.identifier}: ${newIssue.title}`);
+
+            // Comment PR link on Linear issue
+            await linearGql(`
+              mutation($input: CommentCreateInput!) {
+                commentCreate(input: $input) { success }
+              }
+            `, { input: {
+              issueId: newIssue.id,
+              body: `PR opened: ${prUrl}\n\nRepo: ${repoName}`,
+            }});
+
+            // Comment Linear link on the PR
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: `Linked to Linear: [${newIssue.identifier}](https://linear.app/priveperfumes/issue/${newIssue.identifier.toLowerCase()})\n\nPipeline will track review and deploy automatically.`,
+            });
+
+            console.log(`Bridge complete — created ${newIssue.identifier}`);
