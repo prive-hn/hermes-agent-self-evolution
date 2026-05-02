@@ -64,6 +64,22 @@ jobs:
               return m ? parseInt(m[1]) : null;
             }
 
+            // Find Linear issue from the bridge's prior PR comment when no PRV ref is in title/body
+            async function findLinkedIssueRef() {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                per_page: 100,
+              });
+              for (const comment of [...comments].reverse()) {
+                const body = comment.body || '';
+                const m = body.match(/Linked to Linear:\s*\[PRV-(\d+)\]/i) || body.match(/linear\.app\/priveperfumes\/issue\/prv-(\d+)/i);
+                if (m) return parseInt(m[1], 10);
+              }
+              return null;
+            }
+
             // Fetch issue by number
             async function fetchIssue(number) {
               const result = await linearGql(`
@@ -78,9 +94,9 @@ jobs:
 
             // === MERGE HANDLER: close Linear issue ===
             if (isMerged) {
-              const issueNumber = findIssueRef();
+              const issueNumber = findIssueRef() || await findLinkedIssueRef();
               if (!issueNumber) {
-                console.log('PR merged but no PRV-XXX reference found, skipping close');
+                console.log('PR merged but no Linear issue reference found, skipping close');
                 return;
               }
               const issue = await fetchIssue(issueNumber);
