@@ -109,6 +109,12 @@ jobs:
               return;
             }
 
+            // Guard: closed-but-not-merged PRs should not enter the open/ready path
+            if (pr.state === 'closed') {
+              console.log('PR closed without merge, skipping bridge');
+              return;
+            }
+
             // === OPEN / READY: link or create Linear issue ===
             const issueNumber = findIssueRef();
             if (issueNumber) {
